@@ -14,8 +14,10 @@ def load_config(config_file="config.yaml"):
 
 config = load_config()
 CADENCE_UUID = config["cadence_uuid"]
-WHEEL_CIRCUMFERENCE = config["wheel_circumference"]
-GEAR_RATIO = config["gear_ratio"]
+
+# Globals to track data
+prev_crank_event_time = None
+prev_crank_revolutions = 0
 
 # bluetooth handler
 # Find Sensor
@@ -62,10 +64,34 @@ async def connect_to_sensor():
         print(f"[ERROR] Exception during BLE connection or data streaming: {e}")
 
 # Handle incoming data
+# Handle incoming data
 def handle_data(sender, data):
     """Process the incoming BLE data."""
-    print(f"[DATA] Received data from {sender}: {data}")
-    # Add logic to process cadence, speed, etc.
+    global prev_crank_event_time, prev_crank_revolutions
+
+    # Example BLE data parsing (data structure assumed)
+    cumulative_crank_revolutions = int.from_bytes(data[2:4], byteorder='little')
+    last_crank_event_time = int.from_bytes(data[4:6], byteorder='little')
+
+    # Calculate cadence (RPM)
+    if prev_crank_event_time is not None:
+        crank_time_diff = (last_crank_event_time - prev_crank_event_time) / 1024  # Convert to seconds
+        if crank_time_diff > 0:
+            cadence = (cumulative_crank_revolutions - prev_crank_revolutions) / crank_time_diff * 60
+        else:
+            cadence = 0
+    else:
+        cadence = 0
+
+    # Update previous values
+    prev_crank_event_time = last_crank_event_time
+    prev_crank_revolutions = cumulative_crank_revolutions
+
+    print(f"[DATA] Cadence: {cadence:.2f} RPM, Revolutions: {cumulative_crank_revolutions}")
+
+    # Pass cadence and revolutions to metrics calculator
+    process_cadence_data(cadence, cumulative_crank_revolutions)
+
 
 # Example display function
 async def display_data():
@@ -73,3 +99,8 @@ async def display_data():
     for _ in range(10):  # Simulate displaying data 10 times
         print("[INFO] Displaying data...")
         await asyncio.sleep(1)
+
+# Placeholder for cadence processing in metrics calculator
+def process_cadence_data(cadence):
+    """Placeholder function to send cadence data to metrics calculator."""
+    pass

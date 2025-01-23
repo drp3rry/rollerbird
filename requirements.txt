@@ -1,4 +1,5 @@
 async-timeout==4.0.3
+asyncio==3.4.3
 bleak==0.22.3
 exceptiongroup==1.2.2
 iniconfig==2.0.0
@@ -9,6 +10,7 @@ pyobjc-framework-Cocoa==10.3.2
 pyobjc-framework-CoreBluetooth==10.3.2
 pyobjc-framework-libdispatch==10.3.2
 pytest==8.3.4
+pytest-asyncio==0.25.2
 PyYAML==6.0.2
 tomli==2.2.1
 typing_extensions==4.12.2
