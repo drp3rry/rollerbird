@@ -1,5 +1,9 @@
 cadence_uuid: "00002a5b-0000-1000-8000-00805f9b34fb"
 wheel_circumference: 2.1
-gear_ratio: 3.33
+chainring: 50
+cog: 15
 scan_retry_duration: 60
 scan_interval: 5
+terminal_width: 90
+max_speed: 60
+speed_interval: 3

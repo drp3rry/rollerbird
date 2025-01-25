@@ -7,13 +7,20 @@ from math import ceil
 from datetime import datetime
 from bleak import BleakClient, BleakScanner
 
-# Load configuration
-def load_config(config_file="config.yaml"):
-    with open(config_file, "r") as file:
-        return yaml.safe_load(file)
+# # Load configuration
+# def load_config(config_file="config.yaml"):
+#     try:
+#         with open(config_file, "r") as file:
+#             return yaml.safe_load(file)
+#     except FileNotFoundError:
+#         print("[ERROR] Config file not found.")
+#         raise
+#     except yaml.YAMLError as e:
+#         print(f"[ERROR] Failed to parse config: {e}")
+#         raise
 
-config = load_config()
-CADENCE_UUID = config["cadence_uuid"]
+# config = load_config()
+# CADENCE_UUID = config["cadence_uuid"]
 
 # Globals to track data
 prev_crank_event_time = None
@@ -21,7 +28,7 @@ prev_crank_revolutions = 0
 
 # bluetooth handler
 # Find Sensor
-async def find_sensor():
+async def find_sensor(config):
     """Scan for devices for up to 60 seconds, waiting for the sensor to turn on."""
     print("[INFO] Scanning for devices...")
 
@@ -45,10 +52,11 @@ async def find_sensor():
     return None
 
 # Connect to BLE Sensor
-async def connect_to_sensor():
+async def connect_to_sensor(queue, shutdown_event, state, config):
     """Attempt to connect to the sensor and start tracking."""
     print("[INFO] Attempting to find sensor...")
-    address = await find_sensor()
+    address = await find_sensor(config)
+
     if not address:
         print("[ERROR] No sensor found. Please ensure the sensor is active and try again.")
         return
@@ -57,41 +65,89 @@ async def connect_to_sensor():
     try:
         async with BleakClient(address) as client:
             print("[INFO] Connected to sensor. Starting tracking...")
-            await client.start_notify(CADENCE_UUID, handle_data)
-            print("[INFO] Notifications started. Tracking data.")
-            await display_data()  # Start tracking and displaying data
+            await client.start_notify(config["cadence_uuid"], lambda _, data: asyncio.create_task(handle_data(data, queue, state)))
+            print("[INFO] Notifications started. Listening for data...")
+
+            # Wait for shutdown signal
+            await shutdown_event.wait()
+    except asyncio.CancelledError:
+        print("[INFO] Sensor connection task canceled.")
     except Exception as e:
         print(f"[ERROR] Exception during BLE connection or data streaming: {e}")
 
+
 # Handle incoming data
 # Handle incoming data
-def handle_data(sender, data):
-    """Process the incoming BLE data."""
-    global prev_crank_event_time, prev_crank_revolutions
+async def handle_data(data, queue, state):
+    """Process the incoming BLE data and push results to a queue."""
+    # Parse data
+    cumulative_crank_revolutions = int.from_bytes(data[1:3], byteorder="little")
+    last_crank_event_time = int.from_bytes(data[3:5], byteorder="little")
 
-    # Example BLE data parsing (data structure assumed)
-    cumulative_crank_revolutions = int.from_bytes(data[2:4], byteorder='little')
-    last_crank_event_time = int.from_bytes(data[4:6], byteorder='little')
+    # Initialize state if not already present
+    if "prev_crank_event_time" not in state:
+        state["prev_crank_event_time"] = None
+        state["prev_crank_revolutions"] = 0
+        state["last_cadence"] = 0  # Store the last valid cadence
+        state["last_movement_time"] = time.time()
 
-    # Calculate cadence (RPM)
-    if prev_crank_event_time is not None:
-        crank_time_diff = (last_crank_event_time - prev_crank_event_time) / 1024  # Convert to seconds
-        if crank_time_diff > 0:
-            cadence = (cumulative_crank_revolutions - prev_crank_revolutions) / crank_time_diff * 60
-        else:
-            cadence = 0
+    prev_crank_event_time = state["prev_crank_event_time"]
+    prev_crank_revolutions = state["prev_crank_revolutions"]
+
+    current_time = time.time()
+
+
+    # Check for the first event (no previous data to compare with)
+    if prev_crank_event_time is None:
+        # Initialize the state and skip cadence calculation
+        state["prev_crank_event_time"] = last_crank_event_time
+        state["prev_crank_revolutions"] = cumulative_crank_revolutions
+        state["last_movement_time"] = current_time
+        await queue.put({"cadence": 0, "revolutions": cumulative_crank_revolutions})  # No cadence yet
+        return
+
+    # Ignore duplicate events (no time difference)
+    if prev_crank_event_time == last_crank_event_time:
+        state["last_movement_time"] = current_time
+        await queue.put({"cadence": state["last_cadence"], "revolutions": cumulative_crank_revolutions})
+        return
+
+    # Calculate crank time difference
+    crank_time_diff = (last_crank_event_time - prev_crank_event_time) / 1024  # seconds
+    print(f"[DEBUG] Crank Time Diff: {crank_time_diff:.6f}, Prev Time: {prev_crank_event_time}, Last Time: {last_crank_event_time}")
+
+    # Handle rollover
+    if crank_time_diff < 0:
+        crank_time_diff += 65536 / 1024
+
+    # Calculate cadence if time difference is valid
+    if crank_time_diff > 0:
+        cadence = (cumulative_crank_revolutions - prev_crank_revolutions) / crank_time_diff * 60
     else:
-        cadence = 0
+        cadence = state["last_cadence"]  # Retain previous cadence if invalid time difference
 
-    # Update previous values
-    prev_crank_event_time = last_crank_event_time
-    prev_crank_revolutions = cumulative_crank_revolutions
+    # Update state
+    state["prev_crank_event_time"] = last_crank_event_time
+    state["prev_crank_revolutions"] = cumulative_crank_revolutions
+    state["last_cadence"] = cadence
 
-    print(f"[DATA] Cadence: {cadence:.2f} RPM, Revolutions: {cumulative_crank_revolutions}")
+    # Check if cadence should drop to zero
+    if current_time - state["last_movement_time"] > 10:  # 10-second threshold
+        print(f"[DEBUG] Cadence reset: {current_time - state['last_movement_time']:.2f}s since last movement")
+        state["last_cadence"] = 0
 
-    # Pass cadence and revolutions to metrics calculator
-    process_cadence_data(cadence, cumulative_crank_revolutions)
+    # Push the data into the queue
+    await queue.put({"cadence": cadence, "revolutions": cumulative_crank_revolutions})
 
+    # # Optional: Print data for debugging
+    # print(f"[DATA] Cadence: {cadence:.2f} RPM, Revolutions: {cumulative_crank_revolutions}")
+
+
+async def print_queue_updates(queue):
+    while True:
+        data = await queue.get()
+        print(f"[DATA] Cadence: {data['cadence']:.2f} RPM, Revolutions: {data['revolutions']}")
+        queue.task_done()
 
 # Example display function
 async def display_data():

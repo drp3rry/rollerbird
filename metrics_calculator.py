@@ -1,77 +1,99 @@
-# metrics_calculator.py
+import asyncio
+import time
+from collections import deque
+import yaml
 
-# Globals for total calculations
-total_distance = 0  # in meters
-total_time = 0  # in seconds
-speed_buffer = []  # Buffer to track 30-second speeds
-MAX_BUFFER_SIZE = 30  # Assuming 1 update per second
+async def calculate_metrics(cadence_queue, metrics_queue, shutdown_event, config):
+    """Calculate speed, distance, and averages."""
+    # Config values
+    WHEEL_CIRCUMFERENCE = config["wheel_circumference"]  # in meters
+    GEAR_RATIO = config["chainring"] / config["cog"]  # adjust based on your gear setup
 
-
-# metrics_calculator.py
-
-def process_cadence_data(cadence, revolutions):
-    """Process cadence and revolutions to update metrics."""
-    global total_distance, total_time, speed_buffer
-
-    elapsed_time = 1  # Assume 1 second intervals for simplicity
-
-    # Update metrics using the calculator functions
-    results = update_metrics(
-        cadence=cadence,
-        elapsed_time=elapsed_time,
-        wheel_circumference=2.1,  # Replace with config value
-        gear_ratio=3.33  # Replace with config value
-    )
-
-    # Print results for debugging
-    print(f"Metrics Updated: {results}")
-
-
-
-# Calculate speed
-def calculate_speed(cadence, wheel_circumference, gear_ratio):
-    """Calculate the speed in meters per second."""
-    return cadence * wheel_circumference * gear_ratio / 60  # Cadence is in RPM
-
-# Calculate total distance
-def calculate_distance(revolutions, wheel_circumference):
-    """Calculate the distance in meters."""
-    return revolutions * wheel_circumference
-
-# Calculate total average speed
-def calculate_total_average_speed(total_distance, total_time):
-    """Calculate the total average speed (m/s)."""
-    return total_distance / total_time if total_time > 0 else 0
-
-# Calculate 30-second average speed
-def calculate_30s_average_speed(speed_buffer):
-    """Calculate the 30-second average speed."""
-    return sum(speed_buffer) / len(speed_buffer) if speed_buffer else 0
-
-# Update metrics
-def update_metrics(cadence, elapsed_time, wheel_circumference, gear_ratio):
-    """Update all relevant metrics based on cadence and elapsed time."""
-    global total_distance, total_time, speed_buffer
-
-    # Calculate current speed
-    current_speed = calculate_speed(cadence, wheel_circumference, gear_ratio)
-
-    # Update total distance and time
-    total_distance += current_speed * elapsed_time
-    total_time += elapsed_time
-
-    # Manage speed buffer
-    speed_buffer.append(current_speed)
-    if len(speed_buffer) > MAX_BUFFER_SIZE:
-        speed_buffer.pop(0)
-
-    # Calculate averages
-    total_avg_speed = calculate_total_average_speed(total_distance, total_time)
-    avg_30s_speed = calculate_30s_average_speed(speed_buffer)
-
-    return {
-        "current_speed": current_speed,
-        "total_distance": total_distance,
-        "total_avg_speed": total_avg_speed,
-        "avg_30s_speed": avg_30s_speed,
+    # Metrics state
+    state = {
+        "live_speed": 0,
+        "live_RPM": 0,
+        "total_distance": 0,
+        "average_speed": 0,
+        # "last_speeds": deque(maxlen=30),  # Store the last 30 seconds of speeds
+        "live_speeds": deque(maxlen=config["terminal_width"]),
+        "last_revolutions" : None,
+        "last_time": None,
+        "active_time": 0,
+        "intervals": deque(maxlen=config["terminal_width"])
     }
+
+    interval_start_time = None
+    interval_distance = 0
+
+    while not shutdown_event.is_set():
+        try:
+            data = await asyncio.wait_for(cadence_queue.get(), timeout=1)
+            cadence = data["cadence"]
+            revolutions = data["revolutions"]
+            current_time = time.time()
+
+            if state["last_time"] is None:
+                state["last_time"] = current_time
+                interval_start_time = current_time
+                state["last_revolutions"] = revolutions
+                continue
+
+            time_diff = current_time - state["last_time"]
+            revolutions_diff = revolutions - state["last_revolutions"]
+            distance_increment = revolutions_diff * GEAR_RATIO * WHEEL_CIRCUMFERENCE / 1000  # km
+            state["total_distance"] += distance_increment
+            interval_distance += distance_increment
+
+            state["live_speed"] = (cadence / 60) * GEAR_RATIO * WHEEL_CIRCUMFERENCE * 3.6  # km/h
+
+            if cadence > 0:
+                state["active_time"] += time_diff
+
+            state["live_speeds"].append(state["live_speed"] if cadence > 0 else 0)
+
+
+            state["average_speed"] = state["total_distance"] / (state["active_time"] / 3600) if state["active_time"] > 0 else 0
+
+            # interval_speed = (
+            #     sum(list(state["live_speeds"])[-30:]) / min(30, len(state["live_speeds"]))
+            # ) if state["live_speeds"] else 0
+            # 
+            interval_speed = 0
+
+            interval_time = current_time - interval_start_time
+            if interval_time >= 30:  # every 30 seconds
+                interval_speed = (interval_distance / (interval_time / 3600)) if interval_time > 0 else 0
+                state["intervals"].append({
+                    "avg_speed": interval_speed,
+                    "distance": interval_distance,
+                })
+                interval_start_time = current_time
+                interval_distance = 0
+
+            if current_time - interval_start_time >= 30:  # every 30 seconds
+                state["intervals"].append({
+                    "avg_speed": interval_speed,
+                    "distance": interval_distance
+                })
+                interval_start_time = current_time
+                interval_distance = 0
+
+            state["last_time"] = current_time
+            state["last_revolutions"] = revolutions
+
+            # push metrics to the metrics_queue
+            await metrics_queue.put({
+                "live_RPM": cadence,
+                "live_speed": state["live_speed"],
+                "interval_speed": interval_speed,
+                "average_speed": state["average_speed"],
+                "total_distance": state["total_distance"],
+                "intervals": list(state["intervals"]),
+                "live_speeds": list(state["live_speeds"]),
+                "active_time": state["active_time"]
+            })
+
+        except asyncio.TimeoutError:
+            # no cadence data received in the last second
+            pass
